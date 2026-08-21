@@ -268,7 +268,6 @@ app.get('/api/whatsapp/groups', async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch groups', details: err?.message });
   }
 });
-});
 
 // 4. Send Message (Direct Number or Group JID)
 app.post('/api/whatsapp/send', async (req, res) => {

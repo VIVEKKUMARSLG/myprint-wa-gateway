@@ -48,6 +48,9 @@ let groupsList = [];
 let isConnecting = false;
 let reconnectTimer = null;
 
+// Message store for resolving WhatsApp "Waiting for this message" Signal protocol retry requests
+const sentMessagesCache = new Map();
+
 // Initialize or reconnect WhatsApp Socket
 async function connectToWhatsApp() {
   if (isConnecting) return;
@@ -71,16 +74,38 @@ async function connectToWhatsApp() {
       logger: pino({ level: 'silent' }),
       printQRInTerminal: false,
       auth: state,
-      browser: ['MY PRINT Admin Hub', 'Chrome', '1.0.0'],
+      browser: ['Ubuntu', 'Chrome', '20.0.04'],
       syncFullHistory: false,
+      markOnlineOnConnect: true,
+      generateHighQualityLinkPreview: false,
       connectTimeoutMs: 60000,
       defaultQueryTimeoutMs: 60000,
       keepAliveIntervalMs: 25000,
       emitOwnEvents: false,
-      getMessage: async () => ({ conversation: 'MY PRINT Order Alert' })
+      getMessage: async (key) => {
+        if (key && key.id && sentMessagesCache.has(key.id)) {
+          return sentMessagesCache.get(key.id);
+        }
+        return { conversation: 'MY PRINT Order Alert' };
+      }
     });
 
     sock.ev.on('creds.update', saveCreds);
+
+    // Cache incoming & outgoing messages to answer retry decryption keys instantly
+    sock.ev.on('messages.upsert', async (m) => {
+      try {
+        for (const msg of m.messages || []) {
+          if (msg.key && msg.key.id && msg.message) {
+            sentMessagesCache.set(msg.key.id, msg.message);
+            if (sentMessagesCache.size > 3000) {
+              const firstKey = sentMessagesCache.keys().next().value;
+              sentMessagesCache.delete(firstKey);
+            }
+          }
+        }
+      } catch (e) {}
+    });
 
     sock.ev.on('connection.update', async (update) => {
       try {
@@ -295,6 +320,10 @@ app.post('/api/whatsapp/send', async (req, res) => {
 
     console.log(`📤 Sending WhatsApp message to: ${jid}`);
     const result = await sock.sendMessage(jid, { text: message });
+
+    if (result && result.key && result.key.id && result.message) {
+      sentMessagesCache.set(result.key.id, result.message);
+    }
 
     res.json({
       success: true,

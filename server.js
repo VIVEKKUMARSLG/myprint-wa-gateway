@@ -50,6 +50,7 @@ let reconnectTimer = null;
 
 // Message store for resolving WhatsApp "Waiting for this message" Signal protocol retry requests
 const sentMessagesCache = new Map();
+const groupMetadataCache = new Map();
 
 // Initialize or reconnect WhatsApp Socket
 async function connectToWhatsApp() {
@@ -82,6 +83,18 @@ async function connectToWhatsApp() {
       defaultQueryTimeoutMs: 60000,
       keepAliveIntervalMs: 25000,
       emitOwnEvents: false,
+      cachedGroupMetadata: async (jid) => {
+        if (groupMetadataCache.has(jid)) {
+          return groupMetadataCache.get(jid);
+        }
+        try {
+          const meta = await sock.groupMetadata(jid);
+          groupMetadataCache.set(jid, meta);
+          return meta;
+        } catch (e) {
+          return null;
+        }
+      },
       getMessage: async (key) => {
         if (key && key.id && sentMessagesCache.has(key.id)) {
           return sentMessagesCache.get(key.id);
@@ -151,17 +164,20 @@ async function connectToWhatsApp() {
           connectedUser = sock.user || { id: 'Connected Device' };
           console.log(`🟢 WhatsApp Connected Successfully! Logged in as:`, connectedUser);
 
-          // Fetch groups list safely
+          // Fetch groups list and pre-warm participant sessions
           setTimeout(async () => {
             try {
               if (sock && connectionState === 'open') {
                 const fetchedGroups = await sock.groupFetchAllParticipating();
-                groupsList = Object.values(fetchedGroups).map((g) => ({
-                  id: g.id,
-                  name: g.subject,
-                  participantsCount: g.participants?.length || 0
-                }));
-                console.log(`👥 Loaded ${groupsList.length} WhatsApp groups.`);
+                groupsList = Object.values(fetchedGroups).map((g) => {
+                  groupMetadataCache.set(g.id, g);
+                  return {
+                    id: g.id,
+                    name: g.subject,
+                    participantsCount: g.participants?.length || 0
+                  };
+                });
+                console.log(`👥 Loaded ${groupsList.length} WhatsApp groups into cache.`);
               }
             } catch (gErr) {
               console.warn('Could not fetch groups list:', gErr?.message || gErr);
@@ -253,7 +269,6 @@ app.get('/api/whatsapp/groups', async (req, res) => {
   };
 
   if (connectionState !== 'open' || !sock) {
-    // If not connected but we have cached groups from disk, return them
     const cachedFile = path.join(AUTH_FOLDER, 'groups_cache.json');
     if (fs.existsSync(cachedFile)) {
       try {
@@ -270,12 +285,14 @@ app.get('/api/whatsapp/groups', async (req, res) => {
   try {
     if (groupsList.length === 0) {
       const fetchedGroups = await sock.groupFetchAllParticipating();
-      groupsList = Object.values(fetchedGroups).map((g) => ({
-        id: g.id,
-        name: g.subject,
-        participantsCount: g.participants?.length || 0
-      }));
-      // Save to disk cache
+      groupsList = Object.values(fetchedGroups).map((g) => {
+        groupMetadataCache.set(g.id, g);
+        return {
+          id: g.id,
+          name: g.subject,
+          participantsCount: g.participants?.length || 0
+        };
+      });
       try {
         fs.writeFileSync(path.join(AUTH_FOLDER, 'groups_cache.json'), JSON.stringify(groupsList), 'utf8');
       } catch (e) {}
@@ -318,6 +335,18 @@ app.post('/api/whatsapp/send', async (req, res) => {
       jid = `${fullPhone}@s.whatsapp.net`;
     }
 
+    // If sending to a group, ensure group metadata & all participant session keys are pre-fetched
+    if (jid.endsWith('@g.us')) {
+      try {
+        const meta = await sock.groupMetadata(jid);
+        if (meta) {
+          groupMetadataCache.set(jid, meta);
+        }
+      } catch (gMetaErr) {
+        console.warn('Group metadata sync notice:', gMetaErr?.message || gMetaErr);
+      }
+    }
+
     console.log(`📤 Sending WhatsApp message to: ${jid}`);
     const result = await sock.sendMessage(jid, { text: message });
 
@@ -352,6 +381,8 @@ app.post('/api/whatsapp/logout', async (req, res) => {
     connectedUser = null;
     currentQrDataUrl = null;
     groupsList = [];
+    groupMetadataCache.clear();
+    sentMessagesCache.clear();
 
     scheduleReconnect(1500);
 
